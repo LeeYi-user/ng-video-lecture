@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -61,47 +62,49 @@ def estimate_loss():
     model.train()
     return out
 
-class Head(nn.Module):
-    """ one head of self-attention """
+class CausalSelfAttention(nn.Module):
+    """
+    A vanilla multi-head masked self-attention layer with a projection at the end.
+    It is possible to use torch.nn.MultiheadAttention here but I am including an
+    explicit implementation here to show that there is nothing too scary here.
+    """
 
-    def __init__(self, head_size):
+    def __init__(self, n_embd, n_head):
         super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
-
-        self.dropout = nn.Dropout(dropout)
+        assert n_embd % n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
+        # regularization
+        self.attn_dropout = nn.Dropout(dropout)
+        self.resid_dropout = nn.Dropout(dropout)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size))
+                                     .view(1, 1, block_size, block_size))
+        self.n_head = n_head
+        self.n_embd = n_embd
 
     def forward(self, x):
-        # input of size (batch, time-step, channels)
-        # output of size (batch, time-step, head size)
-        B,T,C = x.shape
-        k = self.key(x)   # (B,T,hs)
-        q = self.query(x) # (B,T,hs)
-        # compute attention scores ("affinities")
-        wei = q @ k.transpose(-2,-1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
-        wei = F.softmax(wei, dim=-1) # (B, T, T)
-        wei = self.dropout(wei)
-        # perform the weighted aggregation of the values
-        v = self.value(x) # (B,T,hs)
-        out = wei @ v # (B, T, T) @ (B, T, hs) -> (B, T, hs)
-        return out
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
-class MultiHeadAttention(nn.Module):
-    """ multiple heads of self-attention in parallel """
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, n_embd)
-        self.dropout = nn.Dropout(dropout)
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        out = self.dropout(self.proj(out))
-        return out
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
 
 class FeedFoward(nn.Module):
     """ a simple linear layer followed by a non-linearity """
@@ -124,8 +127,7 @@ class Block(nn.Module):
     def __init__(self, n_embd, n_head):
         # n_embd: embedding dimension, n_head: the number of heads we'd like
         super().__init__()
-        head_size = n_embd // n_head
-        self.sa = MultiHeadAttention(n_head, head_size)
+        self.sa = CausalSelfAttention(n_embd, n_head)
         self.ffwd = FeedFoward(n_embd)
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
@@ -222,4 +224,4 @@ for iter in range(max_iters):
 # generate from the model
 context = torch.zeros((1, 1), dtype=torch.long, device=device)
 print(decode(m.generate(context, max_new_tokens=500)[0].tolist()))
-#open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
+open('more.txt', 'w').write(decode(m.generate(context, max_new_tokens=10000)[0].tolist()))
